@@ -1,0 +1,47 @@
+package db
+
+import (
+        "booking/internal/config"
+        "context"
+        "fmt"
+        "time"
+
+        _ "github.com/jackc/pgx/v5/stdlib"
+        "github.com/jmoiron/sqlx"
+        "github.com/scnewma/backoff"
+
+        "log"
+)
+
+func InitDataBaseConnection(maxAttempts int, config *config.DBConfig) (*sqlx.DB, error) {
+        log.Println("Connecting to database ...")
+        dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", config.DBUser, config.DBPass, config.DBHost, config.DBPort, config.DBName)
+
+        var err error
+        var db *sqlx.DB
+        db, err = backoff.Retry(func() (*sqlx.DB, error) {
+                conn, err := sqlx.Open("pgx", dsn)
+                if err != nil {
+                        log.Println("Error connecting to database:", err)
+                        return nil, err
+                }
+                ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+                defer cancel()
+                err = conn.PingContext(ctx)
+                if err != nil {
+                        log.Println("Error pinging database:", err)
+                        return nil, err
+                }
+                return conn, nil
+        }, backoff.MaxRetries(maxAttempts))
+
+        if err != nil {
+                log.Println("Error connecting to database:", err)
+                return nil, err
+        }
+        maxConn := config.MaxConnections
+
+        db.SetMaxOpenConns(maxConn)
+        return db, nil
+
+}
