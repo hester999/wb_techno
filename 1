@@ -1,47 +1,374 @@
-package db
+```
+package main
 
 import (
-        "booking/internal/config"
-        "context"
-        "fmt"
-        "time"
-
-        _ "github.com/jackc/pgx/v5/stdlib"
-        "github.com/jmoiron/sqlx"
-        "github.com/scnewma/backoff"
-
-        "log"
+	"fmt"
 )
 
-func InitDataBaseConnection(maxAttempts int, config *config.DBConfig) (*sqlx.DB, error) {
-        log.Println("Connecting to database ...")
-        dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", config.DBUser, config.DBPass, config.DBHost, config.DBPort, config.DBName)
+type NodeType string
 
-        var err error
-        var db *sqlx.DB
-        db, err = backoff.Retry(func() (*sqlx.DB, error) {
-                conn, err := sqlx.Open("pgx", dsn)
-                if err != nil {
-                        log.Println("Error connecting to database:", err)
-                        return nil, err
-                }
-                ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-                defer cancel()
-                err = conn.PingContext(ctx)
-                if err != nil {
-                        log.Println("Error pinging database:", err)
-                        return nil, err
-                }
-                return conn, nil
-        }, backoff.MaxRetries(maxAttempts))
+const (
+	TaskNode    NodeType = "task"
+	ExclusiveGW NodeType = "exclusivegateway"
+	ParallelGW  NodeType = "paralellgateway"
+)
 
-        if err != nil {
-                log.Println("Error connecting to database:", err)
-                return nil, err
-        }
-        maxConn := config.MaxConnections
-
-        db.SetMaxOpenConns(maxConn)
-        return db, nil
-
+type Node struct {
+	ID       string
+	Type     NodeType
+	Children []*Node
+	Parents  []*Node
 }
+
+func connect(a, b *Node) {
+	a.Children = append(a.Children, b)
+	b.Parents = append(b.Parents, a)
+}
+
+func isGateway(n *Node) bool {
+	return n.Type == ExclusiveGW ||
+		n.Type == ParallelGW
+}
+
+func isSplit(n *Node) bool {
+	return isGateway(n) &&
+		len(n.Children) > 1
+}
+
+func isJoin(n *Node) bool {
+	return isGateway(n) &&
+		len(n.Parents) > 1
+}
+
+func validate(root *Node) error {
+
+	visited := map[string]bool{}
+
+	return validateNode(root, visited)
+}
+
+func validateNode(
+	node *Node,
+	visited map[string]bool,
+) error {
+
+	if visited[node.ID] {
+		return nil
+	}
+
+	visited[node.ID] = true
+
+	// invalid 1->1 gateway
+	if isGateway(node) {
+
+		if len(node.Children) == 1 &&
+			len(node.Parents) == 1 {
+
+			return fmt.Errorf(
+				"gateway %s cannot have 1 parent and 1 child",
+				node.ID,
+			)
+		}
+	}
+
+	// task validation
+	if node.Type == TaskNode {
+
+		if len(node.Parents) > 1 {
+			return fmt.Errorf(
+				"task %s cannot have >1 parent",
+				node.ID,
+			)
+		}
+
+		if len(node.Children) > 1 {
+			return fmt.Errorf(
+				"task %s cannot have >1 child",
+				node.ID,
+			)
+		}
+	}
+
+	// split validation
+	if isSplit(node) {
+
+		join, err := findMatchingJoin(node)
+
+		if err != nil {
+			return err
+		}
+
+		if join == nil {
+			return fmt.Errorf(
+				"split %s has no matching join",
+				node.ID,
+			)
+		}
+
+		fmt.Printf(
+			"%s -> %s\n",
+			node.ID,
+			join.ID,
+		)
+	}
+
+	for _, child := range node.Children {
+
+		if err := validateNode(child, visited); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func findMatchingJoin(split *Node) (*Node, error) {
+
+	type PathState struct {
+		Node  *Node
+		Depth int
+	}
+
+	// candidate -> branch count
+	candidates := map[*Node]int{}
+
+	for _, branch := range split.Children {
+
+		queue := []PathState{{
+			Node:  branch,
+			Depth: 0,
+		}}
+
+		visited := map[string]bool{}
+
+		foundInBranch := map[string]bool{}
+
+		for len(queue) > 0 {
+
+			cur := queue[0]
+			queue = queue[1:]
+
+			node := cur.Node
+			depth := cur.Depth
+
+			key := fmt.Sprintf(
+				"%s:%d",
+				node.ID,
+				depth,
+			)
+
+			if visited[key] {
+				continue
+			}
+
+			visited[key] = true
+
+			// nested same-type split
+			if isSplit(node) &&
+				node.Type == split.Type {
+
+				depth++
+			}
+
+			// same-type join
+			if isJoin(node) &&
+				node.Type == split.Type {
+
+				// nested closer
+				if depth > 0 {
+					depth--
+
+				} else {
+
+					// IMPORTANT:
+					// first visible join on this branch
+					if !foundInBranch[node.ID] {
+
+						foundInBranch[node.ID] = true
+						candidates[node]++
+
+						// STOP branch traversal here
+						// prevents jumping to outer join
+						continue
+					}
+				}
+			}
+
+			for _, child := range node.Children {
+
+				queue = append(queue, PathState{
+					Node:  child,
+					Depth: depth,
+				})
+			}
+		}
+	}
+
+	for join, count := range candidates {
+
+		if count == len(split.Children) {
+
+			// exact branch count validation
+			if len(join.Parents) != len(split.Children) {
+				continue
+			}
+
+			return join, nil
+		}
+	}
+
+	return nil, nil
+}
+
+func main() {
+
+	// example from image:
+	//
+	// exclusive(split)
+	//   ├── exclusive(split)
+	//   │     ├── task
+	//   │     └── task
+	//   │    exclusive(join)
+	//   │
+	//   └── exclusive(split)
+	//         ├── task
+	//         └── task
+	//        exclusive(join)
+	//
+	// exclusive(join)
+
+	node1 := &Node{
+		ID:   "node1",
+		Type: TaskNode,
+	}
+
+	oGw1 := &Node{
+		ID:   "ogw1",
+		Type: ExclusiveGW,
+	}
+
+	node2 := &Node{
+		ID:   "node2",
+		Type: TaskNode,
+	}
+
+	node3 := &Node{
+		ID:   "node3",
+		Type: TaskNode,
+	}
+
+	oGw2 := &Node{
+		ID:   "ogw2",
+		Type: ExclusiveGW,
+	}
+
+	node4 := &Node{
+		ID:   "node4",
+		Type: TaskNode,
+	}
+
+	node5 := &Node{
+		ID:   "node5",
+		Type: TaskNode,
+	}
+
+	cGw2 := &Node{
+		ID:   "cgw2",
+		Type: ExclusiveGW,
+	}
+
+	cGw1 := &Node{
+		ID:   "cgw1",
+		Type: ExclusiveGW,
+	}
+
+	oGw3 := &Node{
+		ID:   "oGw3",
+		Type: ExclusiveGW,
+	}
+
+	node6 := &Node{
+		ID:   "node6",
+		Type: TaskNode,
+	}
+
+	node7 := &Node{
+		ID:   "node7",
+		Type: TaskNode,
+	}
+
+	cGw3 := &Node{
+		ID:   "cGw3",
+		Type: ExclusiveGW,
+	}
+
+	oGw4 := &Node{
+		ID:   "oGw4",
+		Type: ParallelGW,
+	}
+
+	node8 := &Node{
+		ID:   "node8",
+		Type: TaskNode,
+	}
+
+	node9 := &Node{
+		ID:   "node9",
+		Type: TaskNode,
+	}
+
+	cGw4 := &Node{
+		ID:   "cGw4",
+		Type: ParallelGW,
+	}
+
+	node10 := &Node{
+		ID:   "node10",
+		Type: TaskNode,
+	}
+
+	// top branch
+	connect(node1, oGw1)
+
+	connect(oGw1, node2)
+	connect(oGw1, node3)
+
+	connect(node2, oGw2)
+
+	connect(oGw2, node4)
+	connect(oGw2, node5)
+	connect(node4, cGw2)
+	connect(node5, cGw2)
+
+	connect(cGw2, cGw1)
+
+	connect(node3, oGw3)
+
+	connect(oGw3, node6)
+	connect(oGw3, node7)
+	connect(node6, cGw3)
+	connect(node7, cGw3)
+
+	connect(cGw3, oGw4)
+
+	connect(oGw4, node8)
+	connect(oGw4, node9)
+	connect(node8, cGw4)
+	connect(node9, cGw4)
+
+	connect(cGw4, cGw1)
+
+	connect(oGw2, cGw1)
+
+	connect(cGw1, node10)
+
+	err := validate(node1)
+
+	if err != nil {
+		fmt.Println("INVALID:", err)
+		return
+	}
+
+	fmt.Println("VALID")
+}
+```
